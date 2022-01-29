@@ -4,6 +4,7 @@ import math
 import os
 import random
 import select
+import struct
 import time
 
 import alsaaudio
@@ -256,8 +257,13 @@ class AlsaMixerObserver(pykka.ThreadingActor):
         if self._wake_fd is not None:
             poll.register(self._wake_fd, select.EPOLLIN | select.EPOLLET)
 
+        # FIXME: Remove when pyalsaaudio is upgraded
+        # See https://github.com/larsimmisch/pyalsaaudio/pull/108
+        def check_fd(fd):
+            return fd != -1 and fd != struct.unpack("I", b"\xFF\xFF\xFF\xFF")[0]
+
         for fd, event_mask in fds:
-            if fd != -1:
+            if check_fd(fd):
                 poll.register(fd, event_mask | select.EPOLLET)
 
         return poll
