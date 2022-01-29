@@ -1,7 +1,10 @@
+import errno
 import logging
 import math
+import os
+import random
 import select
-import threading
+import time
 
 import alsaaudio
 import gi
@@ -57,6 +60,8 @@ class AlsaMixer(pykka.ThreadingActor, mixer.Mixer):
 
         self._last_volume = None
         self._last_mute = None
+        self._observer = None
+        self._observer_pipe = None
 
         logger.info(
             f"Mixing using ALSA, {cardname}, "
@@ -64,13 +69,28 @@ class AlsaMixer(pykka.ThreadingActor, mixer.Mixer):
         )
 
     def on_start(self):
-        self._observer = AlsaMixerObserver(
-            cardindex=self.cardindex,
-            device=self.device,
-            control=self.control,
-            callback=self.actor_ref.proxy().trigger_events_for_changed_values,
-        )
-        self._observer.start()
+        rfd, wfd = os.pipe()
+        self._observer_pipe = wfd
+        self._observer = AlsaMixerObserver.start(self.actor_ref.proxy(), rfd)
+
+    def on_stop(self):
+        if self._observer is not None:
+            os.write(self._observer_pipe, b"\xFF")
+            self._observer.stop()
+
+        if self._observer_pipe is not None:
+            os.close(self._observer_pipe)
+
+    def on_failure(self):
+        if self._observer is not None:
+            self._observer.stop()
+
+    @property
+    def mixer(self):
+        try:
+            return self._mixer
+        except alsaaudio.ALSAAudioError:
+            return None
 
     @property
     def _mixer(self):
@@ -182,39 +202,73 @@ class AlsaMixer(pykka.ThreadingActor, mixer.Mixer):
             self.trigger_mute_changed(self._last_mute)
 
 
-class AlsaMixerObserver(threading.Thread):
-    daemon = True
-    name = "AlsaMixerObserver"
+class AlsaMixerObserver(pykka.ThreadingActor):
+    name = "alsamixer-observer"
 
-    def __init__(self, cardindex, device, control, callback=None):
+    def __init__(self, parent, wake_fd=None):
         super().__init__()
-        self.running = True
 
-        # Keep the mixer instance alive for the descriptors to work
-        if cardindex is not None:
-            self.mixer = alsaaudio.Mixer(cardindex=cardindex, control=control)
-        else:
-            self.mixer = alsaaudio.Mixer(device=device, control=control)
+        self._parent = parent
+        self._wake_fd = wake_fd
 
-        descriptors = self.mixer.polldescriptors()
-        assert len(descriptors) == 1
-        self.fd = descriptors[0][0]
-        self.event_mask = descriptors[0][1]
-
-        self.callback = callback
-
-    def stop(self):
-        self.running = False
-
-    def run(self):
-        poller = select.epoll()
-        poller.register(self.fd, self.event_mask | select.EPOLLET)
-        while self.running:
+    def on_start(self):
+        while True:
             try:
-                events = poller.poll(timeout=1)
-                if events and self.callback is not None:
-                    self.callback()
-            except OSError as exc:
-                # poller.poll() will raise an IOError because of the
-                # interrupted system call when suspending the machine.
-                logger.debug(f"Ignored IO error: {exc}")
+                self._listen()
+            except (exceptions.MixerError, OSError) as exc:
+                logger.debug(
+                    "ALSA mixer observer is unable to poll controls. "
+                    "Retrying in a few seconds... "
+                    f"Error: {exc}"
+                )
+                time.sleep(random.uniform(5, 10))
+            except SystemExit:
+                logger.info("Stopping ALSA mixer observer loop...")
+                return
+
+    def _listen(self):
+        poll = self._create_poll()
+
+        while True:
+            changes = False
+
+            for _fd, event in poll.poll():
+                if event & select.EPOLLHUP:
+                    return
+                elif event & select.EPOLLERR:
+                    raise OSError(errno.EBADF)
+                else:
+                    changes = True
+
+            if not self._parent.actor_ref.is_alive():
+                if self._wake_fd is not None:
+                    os.close(self._wake_fd)
+                raise SystemExit()
+
+            if changes:
+                self._call_parent()
+
+    def _create_poll(self):
+        fds = self._mixer.polldescriptors()
+
+        poll = select.epoll()
+
+        if self._wake_fd is not None:
+            poll.register(self._wake_fd, select.EPOLLIN | select.EPOLLET)
+
+        for fd, event_mask in fds:
+            if fd != -1:
+                poll.register(fd, event_mask | select.EPOLLET)
+
+        return poll
+
+    @property
+    def _mixer(self):
+        mixer = self._parent.mixer.get()
+        if mixer is None:
+            raise exceptions.MixerError("Mixer is not available")
+
+        return mixer
+
+    def _call_parent(self):
+        self._parent.trigger_events_for_changed_values().get()
