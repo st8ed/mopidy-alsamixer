@@ -1,12 +1,16 @@
 import unittest
 from unittest import mock
 
+import pytest
+
 import copy
+import logging
+import select
 
 import alsaaudio
 
 from mopidy import exceptions
-from mopidy_alsamixer.mixer import AlsaMixer
+from mopidy_alsamixer.mixer import AlsaMixer, AlsaMixerObserver
 
 
 @mock.patch(
@@ -27,7 +31,13 @@ class MixerTest(unittest.TestCase):
         }
     }
 
-    def get_mixer(self, alsa_mock=None, config=None, apply_default_config=True):
+    def get_mixer(
+        self,
+        alsa_mock=None,
+        config=None,
+        apply_default_config=True,
+        running=False,
+    ):
         if config is None:
             config = {"alsamixer": {"card": 0, "control": "Master"}}
         if alsa_mock is not None:
@@ -38,7 +48,11 @@ class MixerTest(unittest.TestCase):
             actual_config["alsamixer"].update(config["alsamixer"])
         else:
             actual_config = config
-        return AlsaMixer(config=actual_config)
+
+        if not running:
+            return AlsaMixer(config=actual_config)
+        else:
+            return AlsaMixer.start(config=actual_config)
 
     def test_has_config(self, alsa_mock):
         config = {"alsamixer": {"card": 0, "control": "Master"}}
@@ -322,3 +336,110 @@ class MixerTest(unittest.TestCase):
         mixer_mock.getmute.assert_called_once_with()
         mixer.trigger_volume_changed.assert_called_once_with(75)
         mixer.trigger_mute_changed.assert_called_once_with(True)
+
+
+class MockException(Exception):
+    pass
+
+
+@mock.patch("mopidy_alsamixer.mixer.select.epoll", spec=select.epoll)
+@mock.patch(
+    "mopidy_alsamixer.mixer.AlsaMixer",
+    spec=AlsaMixer,
+)
+class ObserverTest(unittest.TestCase):
+    @pytest.fixture(autouse=True)
+    def inject_fixtures(self, caplog):
+        self._caplog = caplog
+
+    def test_multiple_fd_multiple_events(self, parent_mock, epoll_mock):
+        parent_mock.trigger_events_for_changed_values.side_effect = (
+            MockException
+        )
+
+        mixer_mock = parent_mock.mixer.get.return_value
+        mixer_mock.polldescriptors.return_value = (
+            (10, select.EPOLLOUT),
+            (11, select.EPOLLIN),
+            (12, select.EPOLLIN | select.EPOLLOUT | select.EPOLLPRI),
+        )
+
+        poll_mock = epoll_mock.return_value.poll
+        poll_mock.return_value = (
+            (11, select.EPOLLIN),
+            (12, select.EPOLLIN | select.EPOLLPRI),
+        )
+
+        observer = AlsaMixerObserver(parent_mock)
+
+        with self.assertRaises(MockException):
+            observer.on_start()
+
+        mixer_mock.polldescriptors.assert_called_once_with()
+        poll_mock.assert_called_once_with()
+
+    def test_hup_event(self, parent_mock, epoll_mock):
+        parent_mock.trigger_events_for_changed_values.side_effect = (
+            MockException
+        )
+
+        mixer_mock = parent_mock.mixer.get.return_value
+        mixer_mock.polldescriptors.return_value = (
+            (10, select.EPOLLIN | select.EPOLLOUT),
+        )
+
+        poll_mock = epoll_mock.return_value.poll
+        poll_mock.side_effect = (
+            ((10, select.EPOLLHUP),),
+            ((10, select.EPOLLERR),),
+            ((10, select.EPOLLIN),),
+        )
+
+        observer = AlsaMixerObserver(parent_mock)
+
+        with self._caplog.at_level(logging.DEBUG), self.assertRaises(
+            MockException
+        ):
+            observer.on_start()
+
+        self.assertIn(
+            "ALSA mixer observer is unable to poll controls. "
+            "Retrying in a few seconds...",
+            self._caplog.text,
+        )
+
+        self.assertEqual(mixer_mock.polldescriptors.call_count, 3)
+        self.assertEqual(poll_mock.call_count, 3)
+
+    def test_mixer_unavailable(self, parent_mock, epoll_mock):
+        parent_mock.trigger_events_for_changed_values.side_effect = (
+            MockException
+        )
+
+        mixer_mock = mock.Mock()
+        mixer_mock.polldescriptors.return_value = (
+            (10, select.EPOLLIN | select.EPOLLOUT),
+        )
+        parent_mock.mixer.get.side_effect = (
+            None,
+            mixer_mock,
+        )
+
+        poll_mock = epoll_mock.return_value.poll
+        poll_mock.return_value = ((10, select.EPOLLIN),)
+
+        observer = AlsaMixerObserver(parent_mock)
+
+        with self._caplog.at_level(logging.DEBUG), self.assertRaises(
+            MockException
+        ):
+            observer.on_start()
+
+        self.assertIn(
+            "ALSA mixer observer is unable to poll controls. "
+            "Retrying in a few seconds...",
+            self._caplog.text,
+        )
+
+        mixer_mock.polldescriptors.assert_called_once_with()
+        poll_mock.assert_called_once_with()
